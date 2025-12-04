@@ -1,706 +1,84 @@
 import os
-import io
-import json
-import asyncio
 import logging
-from datetime import datetime
-
-from dotenv import load_dotenv
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
-
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-
-# =========================
-# BASIC CONFIG
-# =========================
-
-load_dotenv()  # used locally; on Render env vars come from dashboard
-
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-GDRIVE_SERVICE_ACCOUNT_JSON = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
-DRIVE_ROOT_FOLDER_ID = os.environ["DRIVE_ROOT_FOLDER_ID"]  # your main folder
-
-CONFIG_FILE_NAME = "innovators_bot_config.json"
-
+# -------------------
+# Logging (for Render)
+# -------------------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler(timezone="Asia/Singapore")
-
-# -------------------------------
-# GOOGLE DRIVE (APP DATA FOLDER)
-# -------------------------------
-
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
-import json
-import base64
-
-SCOPES = ["https://www.googleapis.com/auth/drive.appdata"]
-
-def get_drive_service():
-    """
-    Connects to Google Drive AppDataFolder using Service Account JSON from env.
-    """
-    info = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
-    credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
-    service = build("drive", "v3", credentials=credentials)
-    return service
-
-
-def find_config_file(service):
-    """
-    Searches for config JSON inside the AppDataFolder only.
-    """
-    query = "name = 'innovators_bot_config.json' and trashed = false"
-    
-    results = (
-        service.files()
-        .list(
-            spaces="appDataFolder",
-            q=query,
-            fields="files(id, name)",
-            pageSize=1,
-        )
-        .execute()
-    )
-
-    files = results.get("files", [])
-    if files:
-        return files[0]["id"]
-    return None
-
-
-def load_config():
-    """
-    Load the bot's config from AppDataFolder.
-    If it does not exist, create a default one.
-    """
-
-    service = get_drive_service()
-    file_id = find_config_file(service)
-
-    if file_id is None:
-        # No config — create default
-        default_config = {
-            "admins": [],
-            "teams": {},
-            "scheduled_events": []
-        }
-        save_config(default_config)
-        return default_config
-
-    # File exists → download
-    content = (
-        service.files()
-        .get_media(fileId=file_id)
-        .execute()
-    )
-
-    return json.loads(content)
-
-
-def save_config(config):
-    """
-    Saves config JSON into the AppDataFolder.
-    Replaces existing file if found.
-    """
-    service = get_drive_service()
-
-    # Convert dict → bytes
-    data = json.dumps(config).encode("utf-8")
-    media = MediaInMemoryUpload(data, mimetype="application/json")
-
-    # Look for existing config file
-    file_id = find_config_file(service)
-
-    if file_id:
-        # Update existing file
-        service.files().update(
-            fileId=file_id,
-            media_body=media
-        ).execute()
-    else:
-        # Create new file
-        service.files().create(
-            body={
-                "name": "innovators_bot_config.json",
-                "parents": ["appDataFolder"],
-            },
-            media_body=media,
-        ).execute()
-
-    print("Config saved to Google AppDataFolder.")
-
-
-# =========================
-# ADMIN & PERMISSIONS
-# =========================
-
-def is_admin(user_id: int) -> bool:
-    config = load_config()
-    return user_id in config.get("admins", [])
-
-
-async def ensure_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if user is admin. If not, reply and return False."""
-    user = update.effective_user
-    if user is None:
-        return False
-    if not is_admin(user.id):
-        await update.effective_message.reply_text("❌ You are not an admin of this bot.")
-        return False
-    return True
-
-
-# =========================
-# TELEGRAM HANDLERS
-# =========================
+# -------------------
+# Commands
+# -------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    config = load_config()
-
-    text = (
-        "👋 *EEE Garage Innovators’ Track Bot*\n\n"
-        "I can help with:\n"
-        "• 🔁 Zoom update reminders with PIC (AY25/26 and earlier teams)\n"
-        "• 📆 Quarterly reminders for PIC/Director\n"
-        "• 📤 Uploading purchase request sheets to Google Drive\n"
-        "• 🎤 Pitching Night & 👥 Sharing Session reminders\n\n"
-        "If you're an admin, use /init (first time) or /setup to configure me.\n"
-        "Teams can simply send purchase request files here in PM."
-    )
-    await update.effective_message.reply_markdown(text)
-
-    # First-ever admin: if none exist yet, make this user the first admin
-    if not config.get("admins"):
-        if user:
-            config["admins"] = [user.id]
-            save_config(config)
-            await update.effective_message.reply_text(
-                f"✅ You ({user.id}) have been set as the *first admin* of this bot.\n"
-                f"Use /setup to configure groups and dates."
-            )
-
-
-async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show admin setup instructions."""
-    if not await ensure_admin(update, context):
-        return
-
-    text = (
-        "🛠 *Admin Setup Menu*\n\n"
-        "Run these commands in the correct places:\n\n"
-        "1️⃣ In the AY25/26 PIC group:\n"
-        "   → /set_pic_new\n\n"
-        "2️⃣ In the PIC group for teams before AY25/26:\n"
-        "   → /set_pic_old\n\n"
-        "3️⃣ In the group/chat where quarterly reminders should go:\n"
-        "   → /set_quarterly_here\n\n"
-        "4️⃣ In the group where Pitching Night reminders should go:\n"
-        "   → /set_pitch_here\n"
-        "   Then in *PM with bot*:\n"
-        "   → /set_pitch_time DD-MM-YYYY HH:MM\n\n"
-        "5️⃣ In the group where Sharing Session reminders should go:\n"
-        "   → /set_sharing_here\n"
-        "   Then in *PM with bot*:\n"
-        "   → /set_sharing_time DD-MM-YYYY HH:MM\n\n"
-        "6️⃣ Admin management (PM with bot):\n"
-        "   → /admins   (show current admins)\n"
-        "   → /add_admin (as a reply to their message OR with id)\n"
-        "   → /remove_admin (reply or give id)\n\n"
-        "7️⃣ To see all saved settings:\n"
-        "   → /settings\n"
-    )
-    await update.effective_message.reply_markdown(text)
-
-
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    config = load_config()
-    text = (
-        "*Current Settings:*\n\n"
-        f"Admins: {config.get('admins', [])}\n\n"
-        f"PIC (AY25/26) chat id: {config.get('pic_chat_id_new')}\n"
-        f"PIC (before AY25/26) chat id: {config.get('pic_chat_id_old')}\n"
-        f"Quarterly reminder chats: {config.get('quarterly_chat_ids', [])}\n\n"
-        f"Pitch chat id: {config.get('pitch_chat_id')}\n"
-        f"Pitch datetime: {config.get('pitch_datetime')}\n\n"
-        f"Sharing chat id: {config.get('sharing_chat_id')}\n"
-        f"Sharing datetime: {config.get('sharing_datetime')}\n"
-    )
-    await update.effective_message.reply_markdown(text)
-
-
-async def admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    config = load_config()
-    await update.effective_message.reply_text(f"👤 Admin user IDs: {config.get('admins', [])}")
-
-
-async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-
-    config = load_config()
-    admins = set(config.get("admins", []))
-
-    # Prefer reply-based
-    if update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user:
-        new_admin_id = update.effective_message.reply_to_message.from_user.id
-    else:
-        # Try parse from argument
-        if not context.args:
-            await update.effective_message.reply_text(
-                "Usage:\n"
-                "• Reply to a message: /add_admin\n"
-                "• Or: /add_admin <telegram_user_id>"
-            )
-            return
-        try:
-            new_admin_id = int(context.args[0])
-        except ValueError:
-            await update.effective_message.reply_text("Invalid user id.")
-            return
-
-    admins.add(new_admin_id)
-    config["admins"] = list(admins)
-    save_config(config)
-    await update.effective_message.reply_text(f"✅ Added admin: {new_admin_id}")
-
-
-async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-
-    config = load_config()
-    admins = set(config.get("admins", []))
-
-    if update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user:
-        remove_id = update.effective_message.reply_to_message.from_user.id
-    else:
-        if not context.args:
-            await update.effective_message.reply_text(
-                "Usage:\n"
-                "• Reply to a message: /remove_admin\n"
-                "• Or: /remove_admin <telegram_user_id>"
-            )
-            return
-        try:
-            remove_id = int(context.args[0])
-        except ValueError:
-            await update.effective_message.reply_text("Invalid user id.")
-            return
-
-    if remove_id in admins:
-        admins.remove(remove_id)
-        config["admins"] = list(admins)
-        save_config(config)
-        await update.effective_message.reply_text(f"✅ Removed admin: {remove_id}")
-    else:
-        await update.effective_message.reply_text("User is not an admin.")
-
-
-# ===== GROUP SETUP COMMANDS (RUN IN TARGET GROUPS) =====
-
-async def set_pic_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run this in AY25/26 PIC group."""
-    if not await ensure_admin(update, context):
-        return
-    chat = update.effective_chat
-    config = load_config()
-    config["pic_chat_id_new"] = chat.id
-    save_config(config)
-    await update.effective_message.reply_text(
-        f"✅ Set AY25/26 PIC chat id to {chat.id}"
+    await update.message.reply_text(
+        "👋 *EEE Garage Innovators Track Bot*\nBot is running successfully!",
+        parse_mode="Markdown"
     )
 
-
-async def set_pic_old(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run this in PIC group for teams before AY25/26."""
-    if not await ensure_admin(update, context):
-        return
-    chat = update.effective_chat
-    config = load_config()
-    config["pic_chat_id_old"] = chat.id
-    save_config(config)
-    await update.effective_message.reply_text(
-        f"✅ Set pre-AY25/26 PIC chat id to {chat.id}"
+async def zoom_future(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔔 Reminder for AY25/26 teams: Please join the next Zoom update with your PIC!"
     )
 
-
-async def set_quarterly_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run this in any chat where quarterly reminder should appear."""
-    if not await ensure_admin(update, context):
-        return
-    chat = update.effective_chat
-    config = load_config()
-    lst = set(config.get("quarterly_chat_ids", []))
-    lst.add(chat.id)
-    config["quarterly_chat_ids"] = list(lst)
-    save_config(config)
-    await update.effective_message.reply_text(
-        f"✅ Added this chat ({chat.id}) to quarterly reminders."
+async def zoom_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔔 Reminder for pre-AY25/26 teams: Please attend your scheduled Zoom update with PIC!"
     )
 
-
-async def set_pitch_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    chat = update.effective_chat
-    config = load_config()
-    config["pitch_chat_id"] = chat.id
-    save_config(config)
-    await update.effective_message.reply_text(
-        f"✅ Set Pitching Night reminders to this chat ({chat.id}).\n"
-        "Now set the date/time in PM with:\n"
-        "/set_pitch_time DD-MM-YYYY HH:MM"
+async def pitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎤 Reminder: Pitching Night is coming soon! Please prepare your deck!"
     )
 
-
-async def set_sharing_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    chat = update.effective_chat
-    config = load_config()
-    config["sharing_chat_id"] = chat.id
-    save_config(config)
-    await update.effective_message.reply_text(
-        f"✅ Set Sharing Session reminders to this chat ({chat.id}).\n"
-        "Now set the date/time in PM with:\n"
-        "/set_sharing_time DD-MM-YYYY HH:MM"
+async def sharing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤝 Reminder: Sharing Session is happening soon! Make sure your team is ready!"
     )
 
-
-# ===== DATE/TIME COMMANDS (RUN IN PM) =====
-
-def parse_datetime_str(dt_str: str) -> datetime:
-    # Format: DD-MM-YYYY HH:MM
-    return datetime.strptime(dt_str, "%d-%m-%Y %H:%M")
-
-
-async def set_pitch_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: /set_pitch_time DD-MM-YYYY HH:MM\nExample: /set_pitch_time 10-02-2026 18:00"
-        )
-        return
-    dt_str = " ".join(context.args)
-    try:
-        dt = parse_datetime_str(dt_str)
-    except ValueError:
-        await update.effective_message.reply_text("❌ Invalid format. Use: DD-MM-YYYY HH:MM")
-        return
-
-    config = load_config()
-    config["pitch_datetime"] = dt.isoformat()
-    save_config(config)
-
-    # schedule or reschedule job
-    schedule_pitch_job(context.application, dt)
-    await update.effective_message.reply_text(f"✅ Pitching Night reminder scheduled at {dt.isoformat()}")
-
-
-async def set_sharing_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: /set_sharing_time DD-MM-YYYY HH:MM\nExample: /set_sharing_time 15-03-2026 19:00"
-        )
-        return
-    dt_str = " ".join(context.args)
-    try:
-        dt = parse_datetime_str(dt_str)
-    except ValueError:
-        await update.effective_message.reply_text("❌ Invalid format. Use: DD-MM-YYYY HH:MM")
-        return
-
-    config = load_config()
-    config["sharing_datetime"] = dt.isoformat()
-    save_config(config)
-
-    schedule_sharing_job(context.application, dt)
-    await update.effective_message.reply_text(f"✅ Sharing Session reminder scheduled at {dt.isoformat()}")
-
-
-# ===== PURCHASE REQUEST HANDLER (PM DOCUMENTS) =====
-
-async def handle_purchase_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Any document sent in PRIVATE chat is treated as a purchase request sheet.
-    """
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if chat.type != chat.PRIVATE:
-        # ignore group docs for now
-        return
-
-    if not message or not message.document:
-        return
-
-    doc = message.document
-    file_id = doc.file_id
-    filename = doc.file_name or "purchase_request"
-
-    await message.reply_text("📥 Downloading your file...")
-
-    file = await context.bot.get_file(file_id)
-    bio = io.BytesIO()
-    await file.download_to_memory(out=bio)
-    bio.seek(0)
-
-    await message.reply_text("⬆️ Uploading to Google Drive...")
-    drive_file_id = upload_file_to_drive(bio.read(), filename, subfolder_name="PurchaseRequests")
-    drive_link = f"https://drive.google.com/file/d/{drive_file_id}/view"
-
-    await message.reply_text(
-        f"✅ Purchase request uploaded!\n\n"
-        f"Filename: {filename}\n"
-        f"Drive link: {drive_link}\n"
-        "The committee can now review and process it."
+async def purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📄 Please send your purchase request sheet to the committee!"
     )
 
-
-# =========================
-# SCHEDULED JOBS
-# =========================
-
-async def job_zoom_new(application):
-    """
-    Reminder of Zoom update with PIC for AY25/26 teams onwards.
-    """
-    config = load_config()
-    chat_id = config.get("pic_chat_id_new")
-    if not chat_id:
-        return
-    text = (
-        "📣 *Reminder: Innovators' Track Zoom update (AY25/26 teams onwards)*\n\n"
-        "Please update your PIC on this week's progress, blockers, and next steps."
-    )
-    await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-
-
-async def job_zoom_old(application):
-    """
-    Reminder of Zoom update with PIC for teams before AY25/26.
-    """
-    config = load_config()
-    chat_id = config.get("pic_chat_id_old")
-    if not chat_id:
-        return
-    text = (
-        "📣 *Reminder: Innovators' Track Zoom update (pre-AY25/26 teams)*\n\n"
-        "Please update your PIC on your current progress and upcoming milestones."
-    )
-    await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-
-
-async def job_quarterly(application):
-    """
-    Quarterly reminder to PIC/Director (via Telegram chats, not email).
-    """
-    config = load_config()
-    chat_ids = config.get("quarterly_chat_ids", [])
-    if not chat_ids:
-        return
-    text = (
-        "📆 *Quarterly Update Reminder*\n\n"
-        "Please compile and share the quarterly update for Innovators’ Track teams:\n"
-        "• Team progress\n"
-        "• Achievements\n"
-        "• Blockers & support needed\n"
-        "• Upcoming milestones"
-    )
-    for cid in chat_ids:
-        try:
-            await application.bot.send_message(chat_id=cid, text=text, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Error sending quarterly reminder to {cid}: {e}")
-
-
-async def job_pitch(application):
-    config = load_config()
-    chat_id = config.get("pitch_chat_id")
-    if not chat_id:
-        return
-    text = (
-        "🎤 *Reminder: Pitching Night*\n\n"
-        "Don't forget to attend Pitching Night! Be prepared with:\n"
-        "• Updated slides\n"
-        "• Demo (if any)\n"
-        "• Clear problem, solution, and roadmap.\n"
-    )
-    await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-
-
-async def job_sharing(application):
-    config = load_config()
-    chat_id = config.get("sharing_chat_id")
-    if not chat_id:
-        return
-    text = (
-        "👥 *Reminder: Sharing Session*\n\n"
-        "Friendly reminder to attend the upcoming sharing session. "
-        "Come ready to learn from other teams and share your progress!"
-    )
-    await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-
-
-def schedule_recurring_jobs(application):
-    """
-    Weekly Zoom reminders + quarterly reminders.
-    These jobs read the latest config each time they run.
-    """
-    # Weekly Zoom reminders
-    scheduler.add_job(
-        lambda: asyncio.create_task(job_zoom_new(application)),
-        CronTrigger(day_of_week="mon", hour=20, minute=0),
-        id="zoom_new",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        lambda: asyncio.create_task(job_zoom_old(application)),
-        CronTrigger(day_of_week="tue", hour=20, minute=0),
-        id="zoom_old",
-        replace_existing=True,
-    )
-
-    # Quarterly reminders (Jan, Apr, Jul, Oct on 1st at 09:00)
-    scheduler.add_job(
-        lambda: asyncio.create_task(job_quarterly(application)),
-        CronTrigger(month="1,4,7,10", day="1", hour=9, minute=0),
-        id="quarterly",
-        replace_existing=True,
-    )
-
-
-def schedule_pitch_job(application, dt: datetime):
-    scheduler.add_job(
-        lambda: asyncio.create_task(job_pitch(application)),
-        DateTrigger(run_date=dt),
-        id="pitch",
-        replace_existing=True,
-    )
-    logger.info(f"Scheduled Pitching Night job at {dt.isoformat()}")
-
-
-def schedule_sharing_job(application, dt: datetime):
-    scheduler.add_job(
-        lambda: asyncio.create_task(job_sharing(application)),
-        DateTrigger(run_date=dt),
-        id="sharing",
-        replace_existing=True,
-    )
-    logger.info(f"Scheduled Sharing Session job at {dt.isoformat()}")
-
-
-def restore_event_jobs_from_config(application):
-    """
-    On startup, read config and (re)schedule pitch/sharing jobs if dates exist.
-    """
-    config = load_config()
-    if config.get("pitch_datetime"):
-        try:
-            dt = datetime.fromisoformat(config["pitch_datetime"])
-            if dt > datetime.now(dt.tzinfo or None):
-                schedule_pitch_job(application, dt)
-        except Exception as e:
-            logger.error(f"Error restoring pitch job: {e}")
-
-    if config.get("sharing_datetime"):
-        try:
-            dt = datetime.fromisoformat(config["sharing_datetime"])
-            if dt > datetime.now(dt.tzinfo or None):
-                schedule_sharing_job(application, dt)
-        except Exception as e:
-            logger.error(f"Error restoring sharing job: {e}")
-
-
-# =========================
-# MAIN
-# =========================
-
+# -------------------
+# Webhook Startup
+# -------------------
 def main():
-    port = int(os.environ.get("PORT", "8080"))
+    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Build bot
+    application = Application.builder().token(TOKEN).build()
 
-    # Commands
+    # Add commands
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("setup", setup))
-    application.add_handler(CommandHandler("settings", settings_cmd))
+    application.add_handler(CommandHandler("zoom_new", zoom_future))
+    application.add_handler(CommandHandler("zoom_old", zoom_before))
+    application.add_handler(CommandHandler("pitch", pitch))
+    application.add_handler(CommandHandler("sharing", sharing))
+    application.add_handler(CommandHandler("purchase", purchase))
 
-    # Admin management
-    application.add_handler(CommandHandler("admins", admins_cmd))
-    application.add_handler(CommandHandler("add_admin", add_admin_cmd))
-    application.add_handler(CommandHandler("remove_admin", remove_admin_cmd))
+    # Start webhook
+    port = int(os.environ.get("PORT", 10000))
 
-    # Group config commands
-    application.add_handler(CommandHandler("set_pic_new", set_pic_new))
-    application.add_handler(CommandHandler("set_pic_old", set_pic_old))
-    application.add_handler(CommandHandler("set_quarterly_here", set_quarterly_here))
-    application.add_handler(CommandHandler("set_pitch_here", set_pitch_here))
-    application.add_handler(CommandHandler("set_sharing_here", set_sharing_here))
-
-    # Date/time commands (PM)
-    application.add_handler(CommandHandler("set_pitch_time", set_pitch_time))
-    application.add_handler(CommandHandler("set_sharing_time", set_sharing_time))
-
-    # Purchase request documents in PM
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & filters.Document.ALL,
-            handle_purchase_document,
-        )
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
     )
-
-    # Scheduler jobs
-    schedule_recurring_jobs(application)
-    restore_event_jobs_from_config(application)
-    scheduler.start()
-    logger.info("Scheduler started.")
-
-    if not WEBHOOK_URL:
-        # Local testing mode: polling
-        logger.info("Running in polling mode (no WEBHOOK_URL set).")
-        application.run_polling()
-    else:
-        # Render / production: webhook
-        logger.info(f"Running in webhook mode on port {port}, webhook={WEBHOOK_URL}")
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=TELEGRAM_BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}",
-        )
-
 
 if __name__ == "__main__":
     main()
