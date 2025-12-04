@@ -45,139 +45,111 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone="Asia/Singapore")
 
+# -------------------------------
+# GOOGLE DRIVE (APP DATA FOLDER)
+# -------------------------------
 
-# =========================
-# GOOGLE DRIVE HELPERS
-# =========================
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
+import json
+import base64
+
+SCOPES = ["https://www.googleapis.com/auth/drive.appdata"]
 
 def get_drive_service():
+    """
+    Connects to Google Drive AppDataFolder using Service Account JSON from env.
+    """
     info = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    service = build("drive", "v3", credentials=creds)
+    credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
+    service = build("drive", "v3", credentials=credentials)
     return service
 
 
 def find_config_file(service):
-    """Return (file_id or None) for the config file in the root folder."""
-    query = (
-        f"'{DRIVE_ROOT_FOLDER_ID}' in parents and "
-        f"name = '{CONFIG_FILE_NAME}' and trashed = false"
-    )
+    """
+    Searches for config JSON inside the AppDataFolder only.
+    """
+    query = "name = 'innovators_bot_config.json' and trashed = false"
+    
     results = (
         service.files()
-        .list(q=query, spaces="drive", fields="files(id, name)", pageSize=1)
+        .list(
+            spaces="appDataFolder",
+            q=query,
+            fields="files(id, name)",
+            pageSize=1,
+        )
         .execute()
     )
+
     files = results.get("files", [])
     if files:
         return files[0]["id"]
     return None
 
 
-def load_config() -> dict:
-    """Load config JSON from Drive. If none, create default and upload."""
+def load_config():
+    """
+    Load the bot's config from AppDataFolder.
+    If it does not exist, create a default one.
+    """
+
     service = get_drive_service()
     file_id = find_config_file(service)
+
     if file_id is None:
-        # default config
-        config = {
-            "admins": [],  # list of Telegram user IDs
-            "pic_chat_id_new": None,     # AY25/26 onwards
-            "pic_chat_id_old": None,     # before AY25/26
-            "quarterly_chat_ids": [],    # optional list of chats for quarterly reminders
-            "pitch_chat_id": None,
-            "pitch_datetime": None,      # ISO string
-            "sharing_chat_id": None,
-            "sharing_datetime": None,    # ISO string
+        # No config — create default
+        default_config = {
+            "admins": [],
+            "teams": {},
+            "scheduled_events": []
         }
-        save_config(config)
-        return config
+        save_config(default_config)
+        return default_config
 
-    # download file
-    request = service.files().get_media(fileId=file_id)
-    data = request.execute()
-    config = json.loads(data.decode("utf-8"))
-    return config
-
-
-def save_config(config: dict):
-    """Save config JSON to Drive (create or update)."""
-    service = get_drive_service()
-    file_id = find_config_file(service)
-
-    data_bytes = json.dumps(config, indent=2).encode("utf-8")
-    media = MediaIoBaseUpload(
-        io.BytesIO(data_bytes),
-        mimetype="application/json",
-        resumable=False
-    )
-    file_metadata = {
-        "name": CONFIG_FILE_NAME,
-        "parents": [DRIVE_ROOT_FOLDER_ID],
-    }
-
-    if file_id is None:
-        file = (
-            service.files()
-            .create(body=file_metadata, media_body=media, fields="id")
-            .execute()
-        )
-        logger.info(f"Created config file in Drive: {file.get('id')}")
-    else:
-        file = (
-            service.files()
-            .update(fileId=file_id, body=file_metadata, media_body=media)
-            .execute()
-        )
-        logger.info(f"Updated config file in Drive: {file.get('id')}")
-
-
-def upload_file_to_drive(file_bytes: bytes, filename: str, subfolder_name: str = "PurchaseRequests") -> str:
-    """
-    Uploads a file under DRIVE_ROOT_FOLDER_ID / subfolder_name.
-    Returns: file id.
-    """
-    service = get_drive_service()
-
-    # Ensure subfolder exists
-    # 1. Look for subfolder
-    query = (
-        f"'{DRIVE_ROOT_FOLDER_ID}' in parents and "
-        f"name = '{subfolder_name}' and mimeType = 'application/vnd.google-apps.folder' "
-        f"and trashed = false"
-    )
-    results = (
+    # File exists → download
+    content = (
         service.files()
-        .list(q=query, spaces="drive", fields="files(id, name)", pageSize=1)
+        .get_media(fileId=file_id)
         .execute()
     )
-    files = results.get("files", [])
-    if files:
-        subfolder_id = files[0]["id"]
+
+    return json.loads(content)
+
+
+def save_config(config):
+    """
+    Saves config JSON into the AppDataFolder.
+    Replaces existing file if found.
+    """
+    service = get_drive_service()
+
+    # Convert dict → bytes
+    data = json.dumps(config).encode("utf-8")
+    media = MediaInMemoryUpload(data, mimetype="application/json")
+
+    # Look for existing config file
+    file_id = find_config_file(service)
+
+    if file_id:
+        # Update existing file
+        service.files().update(
+            fileId=file_id,
+            media_body=media
+        ).execute()
     else:
-        # create subfolder
-        folder_metadata = {
-            "name": subfolder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [DRIVE_ROOT_FOLDER_ID],
-        }
-        folder = service.files().create(body=folder_metadata, fields="id").execute()
-        subfolder_id = folder["id"]
+        # Create new file
+        service.files().create(
+            body={
+                "name": "innovators_bot_config.json",
+                "parents": ["appDataFolder"],
+            },
+            media_body=media,
+        ).execute()
 
-    file_metadata = {
-        "name": filename,
-        "parents": [subfolder_id],
-    }
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="application/octet-stream")
-
-    file = service.files().create(
-        body=file_metadata, media_body=media, fields="id"
-    ).execute()
-    file_id = file.get("id")
-    logger.info(f"Uploaded file to Google Drive with id={file_id}")
-    return file_id
+    print("Config saved to Google AppDataFolder.")
 
 
 # =========================
